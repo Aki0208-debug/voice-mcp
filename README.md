@@ -30,7 +30,7 @@ This branch is hardened for a single private deployment. It is not a drop-in pub
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22 or newer
 - Cloudflare Workers account
 - one Cloudflare KV namespace for production (`VOICE_GUARD`)
 - an established OAuth 2.1/OIDC provider such as Auth0 or Stytch
