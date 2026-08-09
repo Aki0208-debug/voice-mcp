@@ -25,5 +25,27 @@
       "enabled": true,
       "head_sampling_rate": 0.01
     }
+  },
+  "env": {
+    "staging": {
+      "vars": {
+        "BOT_NAME": "沈雾",
+        "OAUTH_SCOPES": "voice:generate",
+        "OAUTH_ALLOWED_ALGORITHMS": "RS256",
+        "RATE_LIMIT_REQUESTS": "10",
+        "RATE_LIMIT_WINDOW_SECONDS": "60",
+        "DAILY_CHARACTER_LIMIT": "20000",
+        "MAX_TEXT_CHARACTERS": "600",
+        "MAX_AUDIO_BYTES": "5242880",
+        "MAX_REQUEST_BYTES": "16384",
+        "ENABLE_DIRECT_API": "false"
+      },
+      "kv_namespaces": [
+        {
+          "binding": "VOICE_GUARD",
+          "id": "45346a486aa8427ba0247fc77cb48604"
+        }
+      ]
+    }
   }
 }
