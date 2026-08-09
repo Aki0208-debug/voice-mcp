@@ -1,201 +1,140 @@
-# voice-mcp
+# voice-mcp, private Work edition
 
-An MCP (Model Context Protocol) server for AI voice synthesis with an inline audio player. Give your AI assistant a custom cloned voice!
+A Cloudflare Worker MCP server that turns text into speech and returns a private inline audio player through the open MCP Apps bridge used by ChatGPT Work.
 
-![License](https://img.shields.io/badge/license-MIT-green)
+This branch is hardened for a single private deployment. It is not a drop-in public demo.
 
-## Fork Notice
+## What changed
 
-This repository is a fork of [garan0613/voice-mcp](https://github.com/garan0613/voice-mcp), released under the MIT License.
+- OAuth 2.1 resource metadata and JWT verification for the `speak` tool
+- issuer, audience, expiry, algorithm, subject, and scope validation
+- fail-closed KV usage guard with request and daily character limits
+- bounded text, request body, and audio response sizes
+- no full voice text in application logs
+- no provider response bodies in client errors or logs
+- generic public health response with no voice IDs or configuration details
+- `POST`-only direct generation, disabled by default
+- standalone panel, event polling, and ElevenLabs history routes removed from the deployed surface
+- legacy `/sse` transport disabled; use streamable HTTP at `/mcp`
+- dependency updates and a clean production audit
 
-This fork lives at [Yinglianchun/voice-mcp](https://github.com/Yinglianchun/voice-mcp) and keeps the original MCP `speak(text)` behavior while adding provider switching, ElevenLabs support, and a live visualizer panel.
+## Public surface
 
-## What Changed in This Fork
+| Route | Default | Purpose |
+| --- | --- | --- |
+| `/mcp` | enabled | MCP streamable HTTP endpoint; `speak` itself requires OAuth |
+| `/.well-known/oauth-protected-resource` | enabled | OAuth discovery metadata |
+| `/status` | enabled | generic health only |
+| `/speak` | disabled | authenticated direct audio API, `POST` only |
+| `/panel`, `/events/latest`, `/history` | not exposed | upstream demo routes intentionally removed from the private deployment |
 
-- Added `TTS_PROVIDER` switching between DashScope/CosyVoice and ElevenLabs.
-- Kept the old `speak(text)` call compatible, and extended it to `speak(text, style?, raw_tags?)`.
-- Added ElevenLabs TTS support with configurable model, output format, voice settings, and optional v3 audio tags.
-- Added style-to-tag mapping for ElevenLabs v3, while stripping raw audio tags before DashScope/CosyVoice calls.
-- Added `/status` fields for provider, model, voice, configuration state, and audio tag availability.
-- Added `/panel`, a breathing audio visualizer that listens for the latest MCP `speak` result.
-- Added `/events/latest` so the panel can receive the newest generated voice and text.
-- Added ElevenLabs history loading through `/history?id=...`.
-- Added line-style captions, playback-linked caption timing when ElevenLabs timing data is available, and MP3 download from the panel.
+## Requirements
 
-## Features
+- Node.js 20 or newer
+- Cloudflare Workers account
+- one Cloudflare KV namespace for production (`VOICE_GUARD`)
+- an established OAuth 2.1/OIDC provider such as Auth0 or Stytch
+- DashScope/CosyVoice or ElevenLabs credentials
 
-- **Custom Voice Cloning** — Use DashScope Qwen-TTS Voice Cloning API or ElevenLabs TTS with your own cloned voice
-- **Inline Audio Player** — Beautiful WeChat-style player with waveform visualization
-- **Breathing Visualizer Panel** — Use `/panel` to listen for the latest MCP `speak` output
-- **Transcript Toggle** — Show/hide the spoken text
-- **Dark Mode Support** — Automatic theme adaptation
-- **Cloudflare Workers** — Fast, serverless deployment
+Do not implement a new identity provider inside this Worker. Configure an existing provider that can expose discovery metadata, issue JWT access tokens for the Worker audience, and support the MCP authorization flow.
 
-## Demo
-
-When you call the `speak` tool, you get:
-- A sleek audio player with play/pause button
-- Animated waveform that follows playback progress
-- Duration display
-- Expandable transcript
-
-## Quick Start
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/Yinglianchun/voice-mcp.git
-cd voice-mcp
-```
-
-### 2. Install dependencies
+## Install and verify
 
 ```bash
 npm install
+npm run check
+npx wrangler deploy --dry-run
 ```
 
-### 3. Configure TTS provider
+`npm run check` runs TypeScript validation, unit tests, and the production dependency audit.
 
-Set the provider. If omitted, the worker uses DashScope.
+## Cloudflare KV
+
+Create a guard namespace and add the returned namespace ID to `wrangler.jsonc`:
 
 ```bash
-npx wrangler secret put TTS_PROVIDER  # dashscope or elevenlabs
+npx wrangler kv namespace create VOICE_GUARD
 ```
 
-#### DashScope / CosyVoice
+```jsonc
+"kv_namespaces": [
+  { "binding": "VOICE_GUARD", "id": "<guard-namespace-id>" }
+]
+```
 
-You'll need an Alibaba Cloud DashScope account with Qwen-TTS Voice Cloning access.
+`VOICE_GUARD` is required. If it is absent, voice generation returns `503` before calling the paid provider.
 
-Add your secrets to Cloudflare:
+## Production OAuth variables
+
+Add these non-secret values to `wrangler.jsonc` or the Cloudflare dashboard:
+
+```text
+OAUTH_ISSUER=https://your-issuer.example
+OAUTH_AUDIENCE=https://your-worker.example/mcp
+OAUTH_JWKS_URL=https://your-issuer.example/.well-known/jwks.json
+OAUTH_SCOPES=voice:generate
+OAUTH_ALLOWED_ALGORITHMS=RS256
+```
+
+The authorization server must issue a token whose `aud` matches `OAUTH_AUDIENCE` and whose `scope` or `scp` includes every configured scope. ChatGPT discovers the authorization server through `/.well-known/oauth-protected-resource`.
+
+## TTS secrets
+
+Set secrets with Wrangler; never place them in `wrangler.jsonc`, `.dev.vars`, documentation, or git history.
+
+DashScope/CosyVoice:
 
 ```bash
 npx wrangler secret put DASHSCOPE_API_KEY
 npx wrangler secret put VOICE_ID
-npx wrangler secret put BOT_NAME  # Optional, defaults to "AI"
 ```
 
-Optional:
+Then set `TTS_PROVIDER=dashscope`. The default model is `cosyvoice-v3.5-plus`; override it with `TTS_MODEL` only after confirming the provider supports the selected voice and model together.
 
-```bash
-npx wrangler secret put TTS_MODEL  # Default: qwen3-tts-vc-2026-01-22
-```
-
-#### ElevenLabs
-
-Add your ElevenLabs secrets to Cloudflare:
+ElevenLabs:
 
 ```bash
 npx wrangler secret put ELEVENLABS_API_KEY
-npx wrangler secret put ELEVENLABS_VOICE_ID
 npx wrangler secret put ELEVENLABS_VOICE_ID_ZH
-npx wrangler secret put ELEVENLABS_VOICE_ID_EN
 ```
 
-Optional:
+Then set `TTS_PROVIDER=elevenlabs`. Optional variables include `ELEVENLABS_VOICE_ID_EN`, `ELEVENLABS_MODEL_ID`, language codes, output format, stability, similarity boost, style, speaker boost, and speed.
 
-```bash
-npx wrangler secret put ELEVENLABS_MODEL_ID       # Default: eleven_v3
-npx wrangler secret put ELEVENLABS_OUTPUT_FORMAT  # Default: mp3_44100_128
-npx wrangler secret put ELEVENLABS_LANGUAGE_CODE  # Example: zh
-npx wrangler secret put ELEVENLABS_LANGUAGE_CODE_ZH  # Default with zh voice: zh
-npx wrangler secret put ELEVENLABS_LANGUAGE_CODE_EN  # Default with en voice: en
-npx wrangler secret put ELEVENLABS_STABILITY      # Example: 0.36
-npx wrangler secret put ELEVENLABS_STYLE          # Example: 0.85
-npx wrangler secret put ELEVENLABS_SPEED          # Example: 1.20
+## Local development only
+
+Copy `.dev.vars.example` to `.dev.vars`, replace the placeholders, and keep `.dev.vars` untracked. Development bearer authentication is accepted only when both of these are present:
+
+```text
+ALLOW_INSECURE_DEV_AUTH=true
+DEV_BEARER_TOKEN=<long-random-local-token>
 ```
 
-`eleven_v3` supports audio tags such as `[whispers]`, `[sighs]`, and `[laughs]`.
-`eleven_multilingual_v2` is a steadier choice for ordinary reading.
+Never deploy these two values. Production must use OAuth.
 
-### 4. Deploy
+## Default guardrails
 
-```bash
-npx wrangler deploy
-```
+| Variable | Default |
+| --- | ---: |
+| `RATE_LIMIT_REQUESTS` | 10 |
+| `RATE_LIMIT_WINDOW_SECONDS` | 60 |
+| `DAILY_CHARACTER_LIMIT` | 20000 |
+| `MAX_TEXT_CHARACTERS` | 600 |
+| `MAX_REQUEST_BYTES` | 16384 |
+| `MAX_AUDIO_BYTES` | 5242880 |
 
-### 5. Connect to Claude.ai
+Also configure a provider-side spending cap and alerts. Worker KV counters are deliberately conservative but are not a substitute for the provider's billing controls.
 
-1. Go to **Settings -> Connectors -> Add Connector**
-2. Enter your Worker URL: `https://your-worker.workers.dev/mcp`
-3. Done! The `speak` tool is now available.
+## Connect to ChatGPT Work
 
-## Configuration
+1. Deploy the Worker to a public HTTPS URL.
+2. Verify OAuth discovery and the `/mcp` endpoint with MCP Inspector.
+3. In ChatGPT, enable Developer mode if the workspace policy allows it.
+4. Add a plugin/MCP connection using `https://your-worker.example/mcp`.
+5. Review the discovered `speak` tool and complete the OAuth link.
+6. In a new conversation, request speech and confirm the inline player renders without console errors.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TTS_PROVIDER` | No | `dashscope` or `elevenlabs`; defaults to `dashscope` |
-| `DASHSCOPE_API_KEY` | DashScope | Your DashScope API key |
-| `VOICE_ID` | DashScope | The cloned voice ID (Qwen-TTS VC) |
-| `BOT_NAME` | No | Display name (default: "AI") |
-| `TTS_MODEL` | No | DashScope TTS model (default: `cosyvoice-v3.5-plus`) |
-| `ELEVENLABS_API_KEY` | ElevenLabs | Your ElevenLabs API key |
-| `ELEVENLABS_VOICE_ID` | ElevenLabs | Default/fallback ElevenLabs voice ID |
-| `ELEVENLABS_VOICE_ID_ZH` | No | Chinese ElevenLabs voice ID; auto-selected when text contains Chinese |
-| `ELEVENLABS_VOICE_ID_EN` | No | English ElevenLabs voice ID; auto-selected for English text |
-| `ELEVENLABS_MODEL_ID` | No | ElevenLabs model (default: `eleven_v3`) |
-| `ELEVENLABS_OUTPUT_FORMAT` | No | ElevenLabs output format (default: `mp3_44100_128`) |
-| `ELEVENLABS_LANGUAGE_CODE` | No | ElevenLabs request language code, such as `zh` |
-| `ELEVENLABS_LANGUAGE_CODE_ZH` | No | Chinese request language code; defaults to `zh` when `ELEVENLABS_VOICE_ID_ZH` is set |
-| `ELEVENLABS_LANGUAGE_CODE_EN` | No | English request language code; defaults to `en` when `ELEVENLABS_VOICE_ID_EN` is set |
-| `ELEVENLABS_STABILITY` | No | ElevenLabs voice setting override, such as `0.36` |
-| `ELEVENLABS_SIMILARITY_BOOST` | No | ElevenLabs voice setting override |
-| `ELEVENLABS_STYLE` | No | ElevenLabs voice setting override, such as `0.85` |
-| `ELEVENLABS_USE_SPEAKER_BOOST` | No | ElevenLabs voice setting override, `true` or `false` |
-| `ELEVENLABS_SPEED` | No | ElevenLabs voice setting override, such as `1.20` |
-
-## API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /mcp` | MCP server (SSE protocol) |
-| `GET /panel` | Breathing voice visualizer that listens for MCP `speak` |
-| `GET /events/latest` | Latest generated voice event for the visualizer |
-| `GET /history?id=...` | Load an ElevenLabs history item into the visualizer |
-| `GET /speak?text=Hello` | Direct audio file |
-| `GET /speak?text=Hello&style=soft` | Direct audio file with optional style |
-| `GET /speak?text=[whispers]%20Hello` | Preserve detected ElevenLabs v3 audio tags |
-| `GET /speak?text=[whispers]%20Hello&raw_tags=false` | Strip audio tags explicitly |
-| `POST /speak` with `{ "text": "...", "style": "soft" }` | Direct audio file without URL-length limits |
-| `GET /status` | Health check |
-
-The MCP `speak` tool accepts:
-
-```ts
-speak(text: string, style?: string, raw_tags?: boolean)
-```
-
-Existing `speak(text)` calls remain compatible.
-
-When the MCP `speak` tool succeeds, the Worker stores the latest voice event for
-`/panel`. Keep `/panel` open while using `speak`; when a new voice arrives, the
-visualizer loads it and enables playback.
-ElevenLabs uses the speech-with-timing API to store line-level caption cues for
-sync; providers without timing data fall back to approximate caption progress.
-
-When `TTS_PROVIDER=elevenlabs` and `ELEVENLABS_MODEL_ID=eleven_v3`, detected
-audio tags such as `[whispers]` and `[sighs]` are preserved automatically.
-You can still pass `raw_tags=false` to strip them explicitly. Without raw tags,
-supported styles map to ElevenLabs v3 audio tags:
-
-| Style | Audio tag |
-|-------|-----------|
-| `soft` | `[whispers]` |
-| `teasing` | `[mischievously]` |
-| `excited` | `[excited]` |
-| `tired` | `[sighs]` |
-| `laughing` | `[laughs]` |
-| `curious` | `[curious]` |
-
-DashScope/CosyVoice and non-v3 ElevenLabs calls strip raw audio tags before sending text to the provider.
-
-## Tech Stack
-
-- [Cloudflare Workers](https://workers.cloudflare.com/) — Serverless runtime
-- [MCP SDK](https://github.com/modelcontextprotocol/sdk) — Model Context Protocol
-- [DashScope Qwen-TTS VC](https://dashscope.aliyun.com/) — Voice synthesis
-- [ElevenLabs Text to Speech](https://elevenlabs.io/docs/api-reference/text-to-speech/convert) — Voice synthesis
-- [ext-apps](https://modelcontextprotocol.io/docs/concepts/ext-apps) — Inline UI rendering
+The result is an inline playable audio card, not a native ChatGPT voice-message object and not an unsolicited background push.
 
 ## License
 
-MIT. This fork preserves the upstream license from [garan0613/voice-mcp](https://github.com/garan0613/voice-mcp).
+MIT, following the upstream project.
