@@ -1,0 +1,15 @@
+# Local development only. Never deploy these development-auth values.
+ALLOW_INSECURE_DEV_AUTH=true
+DEV_BEARER_TOKEN=replace-with-a-long-random-local-token
+
+# Choose one TTS provider.
+TTS_PROVIDER=dashscope
+DASHSCOPE_API_KEY=replace-me
+VOICE_ID=replace-me
+TTS_MODEL=cosyvoice-v3.5-plus
+
+# ElevenLabs alternative.
+# TTS_PROVIDER=elevenlabs
+# ELEVENLABS_API_KEY=replace-me
+# ELEVENLABS_VOICE_ID_ZH=replace-me
+# ELEVENLABS_MODEL_ID=eleven_v3
