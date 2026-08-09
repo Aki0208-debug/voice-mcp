@@ -8,15 +8,30 @@
  * License: MIT
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpHandler } from "agents/mcp";
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import {
+  authenticateAuthorization,
+  getAuthChallenge,
+  getAuthConfigurationError,
+  getProtectedResourceMetadata,
+  getRequiredScopes,
+  type AuthEnv,
+  type AuthResult,
+} from "./security.ts";
+import {
+  enforceUsageLimits,
+  estimateBase64Bytes,
+  getMaxAudioBytes,
+  getMaxTextCharacters,
+  type GuardEnv,
+} from "./guard.ts";
 
 // =============================================================================
 // Types
 // =============================================================================
 
-export interface Env {
+export interface Env extends AuthEnv, GuardEnv {
   TTS_PROVIDER?: string;
   DASHSCOPE_API_KEY?: string;
   VOICE_ID?: string;
@@ -36,6 +51,8 @@ export interface Env {
   ELEVENLABS_USE_SPEAKER_BOOST?: string;
   ELEVENLABS_SPEED?: string;
   BOT_NAME?: string;
+  ENABLE_DIRECT_API?: string;
+  MAX_REQUEST_BYTES?: string;
 }
 
 type TtsProvider = "dashscope" | "elevenlabs";
@@ -103,14 +120,14 @@ interface ElevenLabsHistoryItem {
 // =============================================================================
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
-const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v2.html";
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
 // =============================================================================
 
 function getPlayerHTML(botName: string): string {
+  const serializedBotName = JSON.stringify(botName);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -237,7 +254,7 @@ function getPlayerHTML(botName: string): string {
 
   <script>
     const contentEl = document.getElementById('content');
-    const BOT_NAME = '${botName}';
+    const BOT_NAME = ${serializedBotName};
     let audio = null;
     let waveInterval = null;
     
@@ -2485,8 +2502,7 @@ async function generateDashScopeAudio(env: Env, input: SpeakInput): Promise<Audi
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      return { success: false, error: `DashScope API error ${response.status}: ${errorText}` };
+      return { success: false, error: `DashScope API error ${response.status}` };
     }
 
     const data = await response.json() as Record<string, unknown>;
@@ -2533,7 +2549,8 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
     const voiceSettings = getElevenLabsVoiceSettings(env);
     console.log("ElevenLabs TTS request", JSON.stringify({
       model_id: modelId,
-      text: finalText,
+      language: voiceSelection.language,
+      text_characters: Array.from(finalText).length,
     }));
 
     const requestUrl = new URL(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceSelection.voiceId)}/with-timestamps`);
@@ -2558,8 +2575,7 @@ async function generateElevenLabsAudio(env: Env, input: SpeakInput): Promise<Aud
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      return { success: false, error: `ElevenLabs API error ${response.status}: ${errorText}` };
+      return { success: false, error: `ElevenLabs API error ${response.status}` };
     }
 
     const data = await response.json() as {
@@ -2640,7 +2656,7 @@ async function createForcedAlignment(env: Env, text: string, audioBuffer: ArrayB
   });
 
   if (!response.ok) {
-    console.error("ElevenLabs forced alignment failed", response.status, await response.text());
+    console.error("ElevenLabs forced alignment failed", response.status);
     return undefined;
   }
 
@@ -2695,8 +2711,7 @@ async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Pro
     });
 
     if (!metadataResponse.ok) {
-      const errorText = await metadataResponse.text();
-      return { success: false, error: `ElevenLabs history error ${metadataResponse.status}: ${errorText}` };
+      return { success: false, error: `ElevenLabs history error ${metadataResponse.status}` };
     }
 
     const metadata = await metadataResponse.json() as ElevenLabsHistoryItem;
@@ -2707,8 +2722,7 @@ async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Pro
     });
 
     if (!audioResponse.ok) {
-      const errorText = await audioResponse.text();
-      return { success: false, error: `ElevenLabs history audio error ${audioResponse.status}: ${errorText}` };
+      return { success: false, error: `ElevenLabs history audio error ${audioResponse.status}` };
     }
 
     const audioBuffer = await audioResponse.arrayBuffer();
@@ -2751,51 +2765,13 @@ async function generateAudio(env: Env, input: SpeakInput): Promise<AudioResult> 
     : generateDashScopeAudio(env, input);
 }
 
-function getTtsStatus(env: Env): Record<string, unknown> {
-  const provider = getTtsProvider(env);
-
-  if (provider === "elevenlabs") {
-    const modelId = getElevenLabsModel(env);
-    return {
-      provider,
-      model_id: modelId,
-      model: modelId,
-      voice_id: env.ELEVENLABS_VOICE_ID || "",
-      voice_id_zh: env.ELEVENLABS_VOICE_ID_ZH || "",
-      voice_id_en: env.ELEVENLABS_VOICE_ID_EN || "",
-      configured: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID || env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN)),
-      configured_zh: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID)),
-      configured_en: Boolean(env.ELEVENLABS_API_KEY && (env.ELEVENLABS_VOICE_ID_EN || env.ELEVENLABS_VOICE_ID)),
-      audio_tags_enabled: modelId === "eleven_v3",
-      language_mode: env.ELEVENLABS_VOICE_ID_ZH || env.ELEVENLABS_VOICE_ID_EN ? "auto" : "single",
-      language_code: getElevenLabsLanguageCode(env) || "",
-      language_codes: {
-        zh: env.ELEVENLABS_LANGUAGE_CODE_ZH || (env.ELEVENLABS_VOICE_ID_ZH ? "zh" : ""),
-        en: env.ELEVENLABS_LANGUAGE_CODE_EN || (env.ELEVENLABS_VOICE_ID_EN ? "en" : ""),
-      },
-      voice_settings: getElevenLabsVoiceSettings(env),
-    };
-  }
-
-  const modelId = getDashScopeModel(env);
-  return {
-    provider,
-    model_id: modelId,
-    model: modelId,
-    voice_id: env.VOICE_ID ? "configured" : "not configured",
-    configured: Boolean(env.DASHSCOPE_API_KEY && env.VOICE_ID),
-    audio_tags_enabled: false,
-  };
-}
-
-function parseRawTags(value: string | null): boolean | undefined {
-  if (value === null) return undefined;
-  return value.trim().toLowerCase() === "true";
-}
-
-function getSpeakInputError(text: string): string | undefined {
+function getSpeakInputError(text: string, maxCharacters = 600): string | undefined {
   const trimmed = text.trim();
   if (!trimmed) return "Missing text parameter";
+
+  if (Array.from(trimmed).length > maxCharacters) {
+    return `Text exceeds the ${maxCharacters}-character limit`;
+  }
 
   if (/\{text\}/i.test(trimmed)) {
     return "Text placeholder was not replaced";
@@ -2809,57 +2785,22 @@ function getSpeakInputError(text: string): string | undefined {
   return undefined;
 }
 
-function getLatestVoiceCacheRequest(origin: string): Request {
-  return new Request(new URL(LATEST_VOICE_CACHE_PATH, origin).toString(), { method: "GET" });
-}
-
-function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): VoiceEvent {
-  const provider = getTtsProvider(env);
-  const finalText = result.final_text || input.text;
-  const alignment = result.alignment || result.normalized_alignment;
-  const captionCues = createCaptionCues(finalText, alignment);
-
-  return {
-    id: crypto.randomUUID(),
-    text: input.text,
-    audio_base64: result.audio_base64 || "",
-    created_at: new Date().toISOString(),
-    provider,
-    model_id: provider === "elevenlabs" ? getElevenLabsModel(env) : getDashScopeModel(env),
-    caption_cues: captionCues.length ? captionCues : undefined,
-    style: input.style,
-    raw_tags: input.raw_tags,
-  };
-}
-
-async function storeLatestVoiceEvent(origin: string, event: VoiceEvent): Promise<void> {
-  await caches.default.put(
-    getLatestVoiceCacheRequest(origin),
-    Response.json(event, {
-      headers: {
-        "Cache-Control": "public, max-age=3600",
-      },
-    }),
-  );
-}
-
-async function readLatestVoiceEvent(origin: string): Promise<VoiceEvent | null> {
-  const response = await caches.default.match(getLatestVoiceCacheRequest(origin));
-  if (!response) return null;
-  return await response.json<VoiceEvent>();
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 // =============================================================================
 // MCP Server Factory
 // =============================================================================
 
-function createVoiceServer(env: Env, origin: string): McpServer {
-  const botName = env.BOT_NAME || 'AI';
+function createVoiceServer(env: Env, origin: string, requestAuth: AuthResult): McpServer {
+  const botName = env.BOT_NAME || 'Shenwu';
   const PLAYER_HTML = getPlayerHTML(botName);
 
   const server = new McpServer({
     name: "voice-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   const uiCapabilities = {
@@ -2869,7 +2810,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
   } as unknown as Parameters<typeof server.server.registerCapabilities>[0];
   server.server.registerCapabilities(uiCapabilities);
 
-  server.resource(
+  server.registerResource(
     VOICE_RESOURCE_URI,
     VOICE_RESOURCE_URI,
     { mimeType: EXT_APPS_MIME, description: "Voice Player" },
@@ -2879,31 +2820,71 @@ function createVoiceServer(env: Env, origin: string): McpServer {
           uri: VOICE_RESOURCE_URI,
           mimeType: EXT_APPS_MIME,
           text: PLAYER_HTML,
+          _meta: {
+            ui: { prefersBorder: true },
+          },
         },
       ],
     }),
   );
 
+  const speakToolConfig = {
+    title: `${botName}'s Voice`,
+    description: `Generate speech with ${botName}'s configured voice and render it in a private inline audio player.`,
+    inputSchema: z.object({
+      text: z.string().max(getMaxTextCharacters(env)).describe("Text to speak"),
+      style: z.string().max(32).optional().describe("Optional speaking style"),
+      raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3 audio tags when supported"),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    _meta: {
+      ui: { resourceUri: VOICE_RESOURCE_URI },
+      "ui/resourceUri": VOICE_RESOURCE_URI,
+      "openai/outputTemplate": VOICE_RESOURCE_URI,
+      securitySchemes: [{ type: "oauth2", scopes: getRequiredScopes(env) }],
+    },
+  };
+
   server.registerTool(
     "speak",
-    {
-      title: `${botName}'s Voice`,
-      description: `Make ${botName} speak with a custom cloned voice. The audio will play in an inline player.`,
-      inputSchema: z.object({
-        text: z.string().describe("Text to speak"),
-        style: z.string().optional().describe("Optional speaking style"),
-        raw_tags: z.boolean().optional().describe("Allow raw ElevenLabs v3 audio tags when supported"),
-      }),
-      _meta: {
-        ui: { resourceUri: VOICE_RESOURCE_URI },
-        "ui/resourceUri": VOICE_RESOURCE_URI,
-      },
-    },
+    speakToolConfig,
     async ({ text, style, raw_tags }) => {
+      const configurationError = getAuthConfigurationError(env);
+      if (configurationError) {
+        console.error("Voice authentication is not configured");
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Voice authentication is not configured." }],
+          structuredContent: { error: "Authentication configuration is incomplete" },
+        };
+      }
+
+      const auth = requestAuth;
+      if (!auth.ok) {
+        const insufficientScope = auth.error === "insufficient_scope";
+        const challenge = getAuthChallenge(
+          origin,
+          insufficientScope ? "insufficient_scope" : "invalid_token",
+          insufficientScope ? "The access token does not include the required voice scope" : "Sign in to use the private voice service",
+        );
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Authentication required." }],
+          structuredContent: { error: "Authentication required" },
+          _meta: { "mcp/www_authenticate": [challenge] },
+        };
+      }
+
       const input = normalizeSpeakInput({ text, style, raw_tags });
-      const inputError = getSpeakInputError(input.text);
+      const inputError = getSpeakInputError(input.text, getMaxTextCharacters(env));
       if (inputError) {
         return {
+          isError: true,
           content: [
             { type: "text" as const, text: `Voice generation skipped: ${inputError}` },
           ],
@@ -2913,27 +2894,43 @@ function createVoiceServer(env: Env, origin: string): McpServer {
         };
       }
 
+      const guard = await enforceUsageLimits(env, auth.context.subject, Array.from(input.text).length);
+      if (!guard.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: guard.error }],
+          structuredContent: {
+            error: guard.error,
+            retry_after_seconds: guard.retryAfter,
+          },
+        };
+      }
+
       const result = await generateAudio(env, input);
 
       if (result.success && result.audio_base64) {
-        try {
-          await storeLatestVoiceEvent(origin, createVoiceEvent(env, input, result));
-        } catch (error) {
-          console.error("Failed to store latest voice event", error);
+        if (estimateBase64Bytes(result.audio_base64) > getMaxAudioBytes(env)) {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: "Generated audio exceeds the configured response limit." }],
+            structuredContent: { error: "Generated audio is too large" },
+          };
         }
 
         return {
           content: [
-            { type: "text" as const, text: `🎙️ ${botName} says: "${text}"` },
+            { type: "text" as const, text: `${botName}'s voice is ready.` },
           ],
           structuredContent: {
-            text: text,
+            text,
             audio_base64: result.audio_base64,
+            mime_type: "audio/mpeg",
           },
         };
       }
 
       return {
+        isError: true,
         content: [
           { type: "text" as const, text: `Voice generation failed: ${result.error}` },
         ],
@@ -2951,139 +2948,143 @@ function createVoiceServer(env: Env, origin: string): McpServer {
 // Worker Handler
 // =============================================================================
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-};
+function isEnabled(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === "true";
+}
+
+function securityHeaders(contentType?: string): HeadersInit {
+  return {
+    ...(contentType ? { "Content-Type": contentType } : {}),
+    "Cache-Control": "private, no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+  };
+}
+
+function jsonResponse(body: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
+  return Response.json(body, {
+    status,
+    headers: {
+      ...securityHeaders(),
+      ...extraHeaders,
+    },
+  });
+}
+
+async function requireHttpAuth(
+  request: Request,
+  env: Env,
+  origin: string,
+): Promise<{ ok: true; subject: string } | { ok: false; response: Response }> {
+  if (getAuthConfigurationError(env)) {
+    return {
+      ok: false,
+      response: jsonResponse({ error: "Authentication configuration is incomplete" }, 503),
+    };
+  }
+
+  const auth = await authenticateAuthorization(request.headers.get("Authorization"), env);
+  if (auth.ok) return { ok: true, subject: auth.context.subject };
+
+  const insufficientScope = auth.error === "insufficient_scope";
+  const status = insufficientScope ? 403 : 401;
+  const challenge = getAuthChallenge(
+    origin,
+    insufficientScope ? "insufficient_scope" : "invalid_token",
+    insufficientScope ? "The access token does not include the required voice scope" : "Sign in to use the private voice service",
+  );
+  return {
+    ok: false,
+    response: jsonResponse(
+      { error: insufficientScope ? "Insufficient scope" : "Authentication required" },
+      status,
+      { "WWW-Authenticate": challenge },
+    ),
+  };
+}
+
+async function readJsonBody(request: Request, env: Env): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
+  const maxBytes = parsePositiveInteger(env.MAX_REQUEST_BYTES, 16_384);
+  const contentLength = Number.parseInt(request.headers.get("Content-Length") || "0", 10);
+  if (contentLength > maxBytes) {
+    return { ok: false, response: jsonResponse({ error: "Request body is too large" }, 413) };
+  }
+
+  const rawBody = await request.text();
+  if (new TextEncoder().encode(rawBody).length > maxBytes) {
+    return { ok: false, response: jsonResponse({ error: "Request body is too large" }, 413) };
+  }
+
+  try {
+    const body = JSON.parse(rawBody) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { ok: false, response: jsonResponse({ error: "JSON body must be an object" }, 400) };
+    }
+    return { ok: true, body: body as Record<string, unknown> };
+  } catch {
+    return { ok: false, response: jsonResponse({ error: "Invalid JSON body" }, 400) };
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    // MCP Endpoint
-    if (path === '/mcp' || path === '/mcp/' || path === '/sse') {
-      const server = createVoiceServer(env, url.origin);
-      const handler = createMcpHandler(server, {
-        route: null as unknown as string,
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-      return handler(request, env, ctx);
-    }
-
-    if (path === '/panel') {
-      const botName = env.BOT_NAME || 'Haven';
-      return new Response(getVisualizerPanelHTML(botName), {
+    if (path === "/.well-known/oauth-protected-resource" || path === "/.well-known/oauth-protected-resource/mcp") {
+      return Response.json(getProtectedResourceMetadata(url.origin, env), {
         headers: {
-          ...corsHeaders,
-          'Content-Type': 'text/html; charset=utf-8',
-          "Cache-Control": "no-store",
+          "Cache-Control": "public, max-age=300",
+          "Content-Type": "application/json; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
         },
       });
     }
 
-    if (path === '/events/latest') {
-      const event = await readLatestVoiceEvent(url.origin);
-      if (!event || event.id === url.searchParams.get('since')) {
-        return Response.json({ event: null }, {
-          headers: {
-            ...corsHeaders,
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      return Response.json({ event }, {
-        headers: {
-          ...corsHeaders,
-          "Cache-Control": "no-store",
+    if (path === "/mcp" || path === "/mcp/") {
+      const requestAuth = getAuthConfigurationError(env)
+        ? { ok: false, error: "auth_not_configured" } as const
+        : await authenticateAuthorization(request.headers.get("Authorization"), env);
+      const handler = createMcpHandler(
+        () => createVoiceServer(env, url.origin, requestAuth),
+        {
+          legacy: "stateless",
         },
+      );
+      return handler.fetch(request);
+    }
+
+    if (path === "/sse") {
+      return jsonResponse({ error: "Legacy SSE transport is disabled; use /mcp" }, 410);
+    }
+
+    if (path === "/status") {
+      return jsonResponse({
+        status: "ok",
+        service: "voice-mcp",
+        version: "1.1.0",
+        authentication: getAuthConfigurationError(env) ? "not_configured" : "configured",
       });
     }
 
-    if (path === '/history' && request.method === 'GET') {
-      const historyItemId = url.searchParams.get('id')?.trim();
-
-      if (!historyItemId) {
-        return Response.json({ error: 'Missing id parameter' }, {
-          status: 400,
-          headers: corsHeaders,
-        });
+    if (path === "/speak") {
+      if (!isEnabled(env.ENABLE_DIRECT_API)) return new Response("Not Found", { status: 404 });
+      if (request.method !== "POST") {
+        return jsonResponse({ error: "Use POST for direct voice generation" }, 405, { Allow: "POST" });
       }
 
-      const result = await fetchElevenLabsHistoryEvent(env, historyItemId);
-      if (!result.success || !result.event) {
-        return Response.json({ error: result.error || 'History item unavailable' }, {
-          status: 500,
-          headers: corsHeaders,
-        });
-      }
-
-      try {
-        await storeLatestVoiceEvent(url.origin, result.event);
-      } catch (error) {
-        console.error("Failed to store latest voice event", error);
-      }
-
-      return Response.json({ event: result.event }, {
-        headers: {
-          ...corsHeaders,
-          "Cache-Control": "no-store",
-        },
-      });
-    }
-
-    // Status check
-    if (path === '/status') {
-      return Response.json({
-        status: 'ok',
-        service: 'voice-mcp',
-        ...getTtsStatus(env),
-        version: '1.0.0',
-      }, { headers: corsHeaders });
-    }
-
-    // Direct audio API. POST avoids URL-length limits for long voice scripts.
-    if (path === '/speak' && (request.method === 'GET' || request.method === 'POST')) {
-      let textValue = "";
-      let style: string | undefined;
-      let rawTags: boolean | undefined;
-      if (request.method === 'GET') {
-        textValue = url.searchParams.get('text') || "";
-        style = url.searchParams.get('style') || undefined;
-        rawTags = parseRawTags(url.searchParams.get('raw_tags'));
-      } else {
-        let body: unknown;
-        try {
-          body = await request.json();
-        } catch (_error) {
-          return Response.json({ error: 'Invalid JSON body' }, {
-            status: 400,
-            headers: corsHeaders,
-          });
-        }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-          return Response.json({ error: 'JSON body must be an object' }, {
-            status: 400,
-            headers: corsHeaders,
-          });
-        }
-        const payload = body as Record<string, unknown>;
-        textValue = typeof payload.text === 'string' ? payload.text : "";
-        style = typeof payload.style === 'string' ? payload.style : undefined;
-        rawTags = typeof payload.raw_tags === 'boolean' ? payload.raw_tags : undefined;
-      }
-      const inputError = getSpeakInputError(textValue);
+      const auth = await requireHttpAuth(request, env, url.origin);
+      if (!auth.ok) return auth.response;
+      const parsedBody = await readJsonBody(request, env);
+      if (!parsedBody.ok) return parsedBody.response;
+      const payload = parsedBody.body;
+      const textValue = typeof payload.text === "string" ? payload.text : "";
+      const style = typeof payload.style === "string" ? payload.style : undefined;
+      const rawTags = typeof payload.raw_tags === "boolean" ? payload.raw_tags : undefined;
+      const inputError = getSpeakInputError(textValue, getMaxTextCharacters(env));
       if (inputError) {
-        return Response.json({ error: inputError }, {
-          status: 400,
-          headers: corsHeaders
-        });
+        return jsonResponse({ error: inputError }, 400);
       }
 
       const input = normalizeSpeakInput({
@@ -3091,13 +3092,20 @@ export default {
         style,
         raw_tags: rawTags,
       });
+      const guard = await enforceUsageLimits(env, auth.subject, Array.from(input.text).length);
+      if (!guard.ok) {
+        return jsonResponse(
+          { error: guard.error },
+          guard.status,
+          guard.retryAfter ? { "Retry-After": String(guard.retryAfter) } : {},
+        );
+      }
+
       const result = await generateAudio(env, input);
 
       if (result.success && result.audio_base64) {
-        try {
-          await storeLatestVoiceEvent(url.origin, createVoiceEvent(env, input, result));
-        } catch (error) {
-          console.error("Failed to store latest voice event", error);
+        if (estimateBase64Bytes(result.audio_base64) > getMaxAudioBytes(env)) {
+          return jsonResponse({ error: "Generated audio is too large" }, 502);
         }
 
         const binaryString = atob(result.audio_base64);
@@ -3108,22 +3116,16 @@ export default {
 
         return new Response(bytes, {
           headers: {
-            ...corsHeaders,
-            'Content-Type': 'audio/mpeg',
-            'Content-Disposition': 'inline; filename="voice.mp3"',
+            ...securityHeaders("audio/mpeg"),
+            "Content-Disposition": "inline; filename=voice.mp3",
           },
         });
       }
 
-      return Response.json({ error: result.error }, {
-        status: 500,
-        headers: corsHeaders
-      });
+      return jsonResponse({ error: result.error || "Voice generation failed" }, 502);
     }
 
-    // Landing page
-    if (path === '/' || path === '') {
-      const botName = env.BOT_NAME || 'AI';
+    if (path === "/" || path === "") {
       return new Response(
         `<!DOCTYPE html>
 <html><head>
@@ -3131,51 +3133,19 @@ export default {
 <title>voice-mcp</title>
 <style>
   body { font-family: system-ui; max-width: 600px; margin: 40px auto; padding: 20px; color: #333; line-height: 1.6; }
-  h1 { color: #07c160; }
+  h1 { color: #334155; }
   code { background: #f5f5f5; padding: 2px 8px; border-radius: 4px; font-size: 14px; }
-  .section { margin: 24px 0; }
-  .endpoint { margin: 8px 0; }
-  a { color: #07c160; }
 </style>
 </head><body>
-<h1>🎙️ voice-mcp</h1>
-<p>An MCP server for AI voice synthesis with inline audio player.</p>
-
-<div class="section">
-<h3>MCP Server</h3>
-<p>Add this URL to your Claude.ai Connectors:</p>
+<h1>voice-mcp</h1>
+<p>Private MCP voice synthesis with an inline audio player.</p>
+<p>MCP endpoint:</p>
 <code>${url.origin}/mcp</code>
-</div>
-
-<div class="section">
-<h3>Direct API</h3>
-<div class="endpoint">
-  <code>GET /panel</code> — Breathing voice visualizer
-</div>
-<div class="endpoint">
-  <code>GET /history?id=...</code> — Load an ElevenLabs history item into the visualizer
-</div>
-<div class="endpoint">
-  <code>GET /speak?text=Hello</code> — Get audio file directly
-</div>
-<div class="endpoint">
-  <code>GET /status</code> — Health check
-</div>
-</div>
-
-<div class="section">
-<h3>Configuration</h3>
-<p>Bot name: <strong>${botName}</strong></p>
-</div>
-
-<p style="margin-top: 32px; color: #666; font-size: 14px;">
-  <a href="https://github.com/xxx/voice-mcp">GitHub</a> · MIT License
-</p>
 </body></html>`,
-        { headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+        { headers: securityHeaders("text/html; charset=utf-8") },
       );
     }
 
-    return new Response('Not Found', { status: 404 });
+    return new Response("Not Found", { status: 404, headers: securityHeaders("text/plain; charset=utf-8") });
   },
 };
