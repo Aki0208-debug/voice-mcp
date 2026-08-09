@@ -1,9 +1,29 @@
 {
   "name": "voice-mcp",
   "main": "src/index.ts",
-  "compatibility_date": "2025-04-01",
+  "compatibility_date": "2026-08-09",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "BOT_NAME": "沈雾",
+    "OAUTH_SCOPES": "voice:generate",
+    "OAUTH_ALLOWED_ALGORITHMS": "RS256",
+    "RATE_LIMIT_REQUESTS": "10",
+    "RATE_LIMIT_WINDOW_SECONDS": "60",
+    "DAILY_CHARACTER_LIMIT": "20000",
+    "MAX_TEXT_CHARACTERS": "600",
+    "MAX_AUDIO_BYTES": "5242880",
+    "MAX_REQUEST_BYTES": "16384",
+    "ENABLE_DIRECT_API": "false"
+  },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
   }
 }
